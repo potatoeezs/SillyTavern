@@ -19,6 +19,28 @@ import { getVllmVector, getVllmBatchVector } from '../vectors/vllm-vectors.js';
 import { getOllamaVector, getOllamaBatchVector } from '../vectors/ollama-vectors.js';
 
 // Don't forget to add new sources to the SOURCES array
+
+// Serializes all Vector Storage write operations so concurrent browser/device
+// requests cannot load stale index data and overwrite each other.
+let vectorWriteQueue = Promise.resolve();
+
+async function withVectorWriteLock(operation) {
+    const previous = vectorWriteQueue;
+    let release;
+
+    vectorWriteQueue = new Promise(resolve => {
+        release = resolve;
+    });
+
+    await previous;
+
+    try {
+        return await operation();
+    } finally {
+        release();
+    }
+}
+
 const SOURCES = [
     'transformers',
     'mistral',
@@ -318,19 +340,24 @@ async function getIndex(directories, collectionId, source, sourceSettings) {
  * @param {{ hash: number; text: string; index: number; }[]} items - The items to insert
  */
 async function insertVectorItems(directories, collectionId, source, sourceSettings, items) {
-    const store = await getIndex(directories, collectionId, source, sourceSettings);
-
-    await store.beginUpdate();
-
     const vectors = await getBatchVector(source, sourceSettings, items.map(x => x.text), false, directories);
 
-    for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        const vector = vectors[i];
-        await store.upsertItem({ vector: vector, metadata: { hash: item.hash, text: item.text, index: item.index } });
-    }
+    return withVectorWriteLock(async () => {
+        const store = await getIndex(directories, collectionId, source, sourceSettings);
+        await store.beginUpdate();
 
-    await store.endUpdate();
+        try {
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                const vector = vectors[i];
+                await store.upsertItem({ vector: vector, metadata: { hash: item.hash, text: item.text, index: item.index } });
+            }
+
+            await store.endUpdate();
+        } catch (error) {
+            throw error;
+        }
+    });
 }
 
 /**
@@ -342,12 +369,12 @@ async function insertVectorItems(directories, collectionId, source, sourceSettin
  * @returns {Promise<number[]>} - The hashes of the items in the collection
  */
 async function getSavedHashes(directories, collectionId, source, sourceSettings) {
-    const store = await getIndex(directories, collectionId, source, sourceSettings);
-
-    const items = await store.listItems();
-    const hashes = items.map(x => Number(x.metadata.hash));
-
-    return hashes;
+    return withVectorWriteLock(async () => {
+        const store = await getIndex(directories, collectionId, source, sourceSettings);
+        const items = await store.listItems();
+        const hashes = items.map(x => Number(x.metadata.hash));
+        return hashes;
+    });
 }
 
 /**
@@ -359,16 +386,22 @@ async function getSavedHashes(directories, collectionId, source, sourceSettings)
  * @param {number[]} hashes - The hashes of the items to delete
  */
 async function deleteVectorItems(directories, collectionId, source, sourceSettings, hashes) {
-    const store = await getIndex(directories, collectionId, source, sourceSettings);
-    const items = await store.listItemsByMetadata({ hash: { '$in': hashes } });
+    return withVectorWriteLock(async () => {
+        const store = await getIndex(directories, collectionId, source, sourceSettings);
+        const items = await store.listItemsByMetadata({ hash: { '$in': hashes } });
 
-    await store.beginUpdate();
+        await store.beginUpdate();
 
-    for (const item of items) {
-        await store.deleteItem(item.id);
-    }
+        try {
+            for (const item of items) {
+                await store.deleteItem(item.id);
+            }
 
-    await store.endUpdate();
+            await store.endUpdate();
+        } catch (error) {
+            throw error;
+        }
+    });
 }
 
 /**
@@ -383,13 +416,17 @@ async function deleteVectorItems(directories, collectionId, source, sourceSettin
  * @returns {Promise<{hashes: number[], metadata: object[]}>} - The metadata of the items that match the search text
  */
 async function queryCollection(directories, collectionId, source, sourceSettings, searchText, topK, threshold) {
-    const store = await getIndex(directories, collectionId, source, sourceSettings);
     const vector = await getVector(source, sourceSettings, searchText, true, directories);
+    return withVectorWriteLock(async () => {
+        const store = await getIndex(directories, collectionId, source, sourceSettings);
+    
+    
 
     const result = await store.queryItems(vector, topK);
     const metadata = result.filter(x => x.score >= threshold).map(x => x.item.metadata);
     const hashes = result.map(x => Number(x.item.metadata.hash));
     return { metadata, hashes };
+    });
 }
 
 /**
@@ -406,6 +443,8 @@ async function queryCollection(directories, collectionId, source, sourceSettings
  */
 async function multiQueryCollection(directories, collectionIds, source, sourceSettings, searchText, topK, threshold) {
     const vector = await getVector(source, sourceSettings, searchText, true, directories);
+    return withVectorWriteLock(async () => {
+    
     const results = [];
 
     for (const collectionId of collectionIds) {
@@ -435,6 +474,7 @@ async function multiQueryCollection(directories, collectionIds, source, sourceSe
     }
 
     return groupedResults;
+    });
 }
 
 /**
@@ -564,14 +604,16 @@ router.post('/delete', async (req, res) => {
 
 router.post('/purge-all', async (req, res) => {
     try {
-        for (const source of SOURCES) {
-            const sourcePath = path.join(req.user.directories.vectors, sanitize(source));
-            if (!fs.existsSync(sourcePath)) {
-                continue;
+        await withVectorWriteLock(async () => {
+            for (const source of SOURCES) {
+                const sourcePath = path.join(req.user.directories.vectors, sanitize(source));
+                if (!fs.existsSync(sourcePath)) {
+                    continue;
+                }
+                await fs.promises.rm(sourcePath, { recursive: true });
+                console.info(`Deleted vector source store at ${sourcePath}`);
             }
-            await fs.promises.rm(sourcePath, { recursive: true });
-            console.info(`Deleted vector source store at ${sourcePath}`);
-        }
+        });
 
         return res.sendStatus(200);
     } catch (error) {
@@ -588,14 +630,16 @@ router.post('/purge', async (req, res) => {
 
         const collectionId = String(req.body.collectionId);
 
-        for (const source of SOURCES) {
-            const sourcePath = path.join(req.user.directories.vectors, sanitize(source), sanitize(collectionId));
-            if (!fs.existsSync(sourcePath)) {
-                continue;
+        await withVectorWriteLock(async () => {
+            for (const source of SOURCES) {
+                const sourcePath = path.join(req.user.directories.vectors, sanitize(source), sanitize(collectionId));
+                if (!fs.existsSync(sourcePath)) {
+                    continue;
+                }
+                await fs.promises.rm(sourcePath, { recursive: true });
+                console.info(`Deleted vector index at ${sourcePath}`);
             }
-            await fs.promises.rm(sourcePath, { recursive: true });
-            console.info(`Deleted vector index at ${sourcePath}`);
-        }
+        });
 
         return res.sendStatus(200);
     } catch (error) {
