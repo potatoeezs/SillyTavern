@@ -1,3 +1,4 @@
+```bash
 #!/bin/bash
 
 # Configure Git inside container
@@ -28,11 +29,29 @@ cd ..
 
 save_data() {
     (
-        cd data || exit
+        cd data || exit 1
+
         git add -A
+
         if [ -n "$(git status --porcelain)" ]; then
             git commit -m "Auto backup: $(date -u +%F_%T_UTC)"
-            git push origin main --force
+
+            # Only prune local LFS objects after a successful backup
+            if git push origin main --force; then
+                USAGE=$(df /app/data | awk 'NR==2 {print $5}' | tr -d '%')
+
+                if [ "$USAGE" -ge 80 ]; then
+                    echo "Disk usage is ${USAGE}%. Pruning old local Git LFS objects..."
+
+                    if git lfs prune --verify-remote; then
+                        echo "Git LFS prune completed successfully."
+                    else
+                        echo "Git LFS prune failed. Backup is still safe on GitHub."
+                    fi
+                fi
+            else
+                echo "Git push failed. Skipping LFS prune."
+            fi
         fi
     )
 }
@@ -52,3 +71,4 @@ ST_PID=$!
 ) &
 
 wait "$ST_PID"
+```
