@@ -1,89 +1,140 @@
+
 #!/bin/bash
 
-# ---- Paths derived from the real working directory (no hardcoded /app) ----
+set -o pipefail
+
+# ---- Paths ----
 BASE_DIR="$(pwd)"
 DATA_DIR="$BASE_DIR/data"
+TEMP_DIR="$BASE_DIR/temp_data"
 
-log() { echo "[backup $(date -u +%F_%T_UTC)] $*"; }
+log() {
+    echo "[backup $(date -u +%F_%T_UTC)] $*"
+}
 
-# ---- Git identity & safety ----
+# ---- Git identity ----
 git config --global user.email "backup@coolify.local"
 git config --global user.name "Coolify Backup"
-git config --global --add safe.directory "$DATA_DIR"
 
-REPO_URL="https://${GITHUB_TOKEN}@github.com/potatoeezs/st-backup.git"
+# ---- GitHub authentication ----
+if [ -z "$GITHUB_TOKEN" ]; then
+    log "ERROR: GITHUB_TOKEN is missing. Cannot restore backup."
+    exit 1
+fi
+
+REPO_URL="https://github.com/potatoeezs/st-backup.git"
+
+AUTH_HEADER=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w 0)
+
+if ! git config --global \
+    http.https://github.com/.extraheader \
+    "AUTHORIZATION: basic $AUTH_HEADER"; then
+    log "ERROR: Could not configure GitHub authentication."
+    exit 1
+fi
+
+unset AUTH_HEADER
 
 # ---- Tunables ----
-DISK_THRESHOLD=70      # % usage on the data filesystem that triggers LFS prune
-INTERVAL=180           # seconds between cycles
-PRUNE_COOLDOWN=900     # seconds; minimum gap between LFS prunes (0 = every cycle)
+DISK_THRESHOLD=70
+INTERVAL=180
+PRUNE_COOLDOWN=900
 
+# ---- Prepare directories ----
 mkdir -p "$DATA_DIR"
-rm -rf temp_data
+rm -rf "$TEMP_DIR"
 
-# Clone backup if not already present
-if git clone "$REPO_URL" temp_data; then
-    rm -f temp_data/run-backup.sh temp_data/start.sh
-    cp -rn temp_data/. "$DATA_DIR"/ 2>/dev/null || true
-    rm -rf temp_data
+# ---- Restore backup ----
+log "Cloning backup repository..."
+
+if git clone "$REPO_URL" "$TEMP_DIR"; then
+    log "Backup repository cloned successfully."
+
+    # Remove startup scripts from restored data
+    rm -f "$TEMP_DIR/run-backup.sh" "$TEMP_DIR/start.sh"
+
+    # Restore files without overwriting existing local files
+    if ! cp -rn "$TEMP_DIR"/. "$DATA_DIR"/; then
+        log "WARN: Some backup files could not be copied."
+    fi
+
+    rm -rf "$TEMP_DIR"
 else
-    log "WARN: clone failed (network / token / repo?). Continuing with existing local data."
+    log "ERROR: Backup clone failed."
+    log "Check token permissions, repository access, and network."
+    rm -rf "$TEMP_DIR"
+    exit 1
 fi
 
-# Ensure data has git remote initialized
+# ---- Initialize Git in data directory ----
 cd "$DATA_DIR" || exit 1
+
 if [ ! -d ".git" ]; then
-    git init -b main
-    git remote add origin "$REPO_URL"
+    git init -b main || exit 1
 fi
-git remote set-url origin "$REPO_URL"
+
+git config --global --add safe.directory "$DATA_DIR"
+git remote set-url origin "$REPO_URL" 2>/dev/null ||
+    git remote add origin "$REPO_URL"
+
 cd "$BASE_DIR" || exit 1
 
 # ---- Helpers ----
-is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-
-# Portable disk-usage read (wrapped df lines can't break the parse)
-disk_pct() {
-    df -P "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%'
+is_num() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
-# ---- Step 1: LFS prune (runs BEFORE backup, per spec) ----
+disk_pct() {
+    df -P "$DATA_DIR" 2>/dev/null |
+        awk 'NR==2 {print $5}' |
+        tr -d '%'
+}
+
+# ---- LFS pruning ----
 LAST_PRUNE_FILE="$BASE_DIR/.last_lfs_prune"
 
 prune_lfs() {
     local now last age
+
     now=$(date +%s)
     last=0
-    [ -f "$LAST_PRUNE_FILE" ] && last=$(cat "$LAST_PRUNE_FILE" 2>/dev/null || echo 0)
+
+    if [ -f "$LAST_PRUNE_FILE" ]; then
+        last=$(cat "$LAST_PRUNE_FILE" 2>/dev/null || echo 0)
+        is_num "$last" || last=0
+    fi
 
     if [ "$PRUNE_COOLDOWN" -gt 0 ]; then
-        age=$(( now - last ))
+        age=$((now - last))
+
         if [ "$age" -lt "$PRUNE_COOLDOWN" ]; then
-            log "LFS prune skipped (last run ${age}s ago, cooldown ${PRUNE_COOLDOWN}s)."
+            log "LFS prune skipped; cooldown has not elapsed."
             return 0
         fi
     fi
 
     (
         cd "$DATA_DIR" || exit 1
-        # --verify-remote deletes only objects confirmed present on the remote,
-        # so pruning before push cannot lose data.
+
         if git lfs prune --verify-remote; then
             log "LFS prune completed."
             echo "$now" > "$LAST_PRUNE_FILE"
         else
-            log "WARN: LFS prune failed (not an LFS repo? network?). Continuing."
+            log "WARN: LFS prune failed; continuing."
         fi
     )
 }
 
-# ---- Step 2: backup + push (logic unchanged) ----
+# ---- Backup and push ----
 save_data() {
     (
         cd "$DATA_DIR" || exit 1
 
         if ! git add -A; then
-            log "ERROR: git add failed (disk full?). Skipping this cycle."
+            log "ERROR: git add failed. Skipping backup."
             return 1
         fi
 
@@ -91,21 +142,24 @@ save_data() {
             return 0
         fi
 
-        # Safety: never overwrite a good remote with an empty data tree
-        if [ -z "$(find "$DATA_DIR" -maxdepth 3 \( -name 'settings.json' -o -name 'config.yaml' \) -print -quit 2>/dev/null)" ]; then
-            log "WARN: no SillyTavern user data found. Refusing to push to avoid wiping the remote."
+        # Never push without recognizable SillyTavern data
+        if [ -z "$(find "$DATA_DIR" -maxdepth 3 \
+            \( -name 'settings.json' -o -name 'config.yaml' \) \
+            -print -quit 2>/dev/null)" ]; then
+            log "WARN: No SillyTavern user data found."
+            log "Refusing to push to protect the remote backup."
             return 1
         fi
 
         if ! git commit -m "Auto backup: $(date -u +%F_%T_UTC)"; then
-            log "ERROR: commit failed. Skipping this cycle."
+            log "ERROR: Commit failed. Skipping backup."
             return 1
         fi
 
         if git push origin main --force; then
             log "Backup pushed. Data filesystem at $(disk_pct)%."
         else
-            log "ERROR: git push failed (disk full / auth / network?)."
+            log "ERROR: Git push failed."
             return 1
         fi
     )
@@ -114,34 +168,61 @@ save_data() {
 # ---- Main cycle ----
 cycle() {
     local usage
+
     usage=$(disk_pct)
     log "Cycle start. Disk usage: ${usage:-unknown}%."
 
     if is_num "$usage" && [ "$usage" -ge "$DISK_THRESHOLD" ]; then
-        log "Disk at ${usage}% (>= ${DISK_THRESHOLD}%). Pruning LFS before backup."
+        log "Disk threshold reached. Pruning LFS before backup."
         prune_lfs
     else
-        log "Disk at ${usage:-?}% (< ${DISK_THRESHOLD}%). No prune needed."
+        log "Disk usage below threshold. No prune needed."
     fi
 
     save_data
 }
 
-trap 'save_data; kill -TERM $ST_PID 2>/dev/null; exit 0' SIGTERM SIGINT
-
-# Start SillyTavern in the background
+# ---- Start SillyTavern ----
 node server.js &
 ST_PID=$!
 
-# Background loop: disk check -> prune -> backup -> push, every 3 minutes
+# ---- Graceful shutdown ----
+shutdown() {
+    trap - SIGTERM SIGINT
+    log "Shutdown requested. Saving data..."
+
+    save_data
+
+    kill -TERM "$ST_PID" 2>/dev/null || true
+    wait "$ST_PID" 2>/dev/null || true
+
+    exit 0
+}
+
+trap shutdown SIGTERM SIGINT
+
+# ---- Automatic backup loop ----
 (
     while kill -0 "$ST_PID" 2>/dev/null; do
         sleep "$INTERVAL"
-        cycle
+
+        if kill -0 "$ST_PID" 2>/dev/null; then
+            cycle
+        fi
     done
 ) &
 
-wait "$ST_PID"
+BACKUP_PID=$!
 
-# Final save if ST exits on its own
+# Wait for SillyTavern to exit
+wait "$ST_PID"
+ST_EXIT=$?
+
+# ---- Final backup ----
+log "SillyTavern exited with code $ST_EXIT. Running final backup."
+
 save_data
+
+kill "$BACKUP_PID" 2>/dev/null || true
+
+exit "$ST_EXIT"
