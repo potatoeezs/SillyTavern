@@ -254,13 +254,13 @@ performance:
   # Configures gzip compression for client requests with large payloads (e.g. settings or chat saves).
   requestCompression:
     # Enable request compression.
-    enabled: false
+    enabled: true
     # Minimum payload size to trigger compression. Set to 0 to compress all requests regardless of size.
-    minPayloadSize: '256kb'
+    minPayloadSize: 0
     # Hard upper payload size limit for compression. Set to 0 to allow compression of any size.
-    maxPayloadSize: '8mb'
+    maxPayloadSize: 0
     # Timeout for request compression in milliseconds.
-    timeout: 4000
+    timeout: 15000
 
 # CACHE BUSTER CONFIGURATION
 # IMPORTANT: Requires localhost or a domain with HTTPS, otherwise will not work!
