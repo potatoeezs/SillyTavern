@@ -47,7 +47,7 @@ rm -rf "$TEMP_DIR"
 # ---- Restore backup ----
 log "Cloning backup repository..."
 
-if git clone "$REPO_URL" "$TEMP_DIR"; then
+if git clone --depth 1 --single-branch --branch main "$REPO_URL" "$TEMP_DIR"; then
     log "Backup repository cloned successfully."
 
     # Remove startup scripts from restored data
@@ -128,10 +128,82 @@ prune_lfs() {
     )
 }
 
+# ---- Convert extension repositories to regular tracked files ----
+convert_extension_gitlinks() {
+    local extensions_dir="$DATA_DIR/default-user/extensions"
+    local ext_dir rel mode tracked hold
+
+    [ -d "$extensions_dir" ] || return 0
+
+    # Only inspect direct extension folders, not nested repositories.
+    while IFS= read -r -d '' ext_dir; do
+        [ -e "$ext_dir/.git" ] || continue
+
+        rel="${ext_dir#"$DATA_DIR"/}"
+
+        mode=$(git ls-files --stage -- "$rel" |
+            awk 'NR==1 {print $1}')
+
+        tracked=$(git ls-files -- "$rel" | head -n 1)
+
+        # Convert existing gitlinks or newly installed extensions.
+        if [ "$mode" = "160000" ] || [ -z "$tracked" ]; then
+            log "Converting extension to regular files: $rel"
+
+            # Remove only the gitlink from the parent index.
+            if [ "$mode" = "160000" ]; then
+                if ! git rm --cached -f -- "$rel"; then
+                    log "ERROR: Could not remove extension gitlink: $rel"
+                    return 1
+                fi
+            fi
+
+            # Temporarily hide nested Git metadata so Git stages files,
+            # rather than treating the extension as another repository.
+            hold="$BASE_DIR/.extension-git-hold-$$"
+
+            if [ -e "$hold" ]; then
+                log "ERROR: Temporary metadata path already exists: $hold"
+                return 1
+            fi
+
+            if ! mv "$ext_dir/.git" "$hold"; then
+                log "ERROR: Could not temporarily move extension Git metadata: $rel"
+                return 1
+            fi
+
+            if git add -A -- "$rel"; then
+                if ! mv "$hold" "$ext_dir/.git"; then
+                    log "ERROR: Could not restore extension Git metadata: $rel"
+                    log "Metadata remains at: $hold"
+                    return 1
+                fi
+
+                log "Extension files staged successfully: $rel"
+            else
+                mv "$hold" "$ext_dir/.git" || true
+                log "ERROR: Could not stage extension files: $rel"
+                return 1
+            fi
+        fi
+    done < <(
+        find "$extensions_dir" \
+            -mindepth 1 -maxdepth 1 -type d -print0
+    )
+
+    return 0
+}
+
 # ---- Backup and push ----
 save_data() {
     (
         cd "$DATA_DIR" || exit 1
+
+        # Convert extension gitlinks before staging all data.
+        if ! convert_extension_gitlinks; then
+            log "ERROR: Extension conversion failed. Skipping backup."
+            return 1
+        fi
 
         if ! git add -A; then
             log "ERROR: git add failed. Skipping backup."
@@ -142,7 +214,7 @@ save_data() {
             return 0
         fi
 
-        # Never push without recognizable SillyTavern data
+        # Never push without recognizable SillyTavern data.
         if [ -z "$(find "$DATA_DIR" -maxdepth 3 \
             \( -name 'settings.json' -o -name 'config.yaml' \) \
             -print -quit 2>/dev/null)" ]; then
